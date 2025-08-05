@@ -193,7 +193,6 @@ class Server(AbstractTunnel):
         def on_pkt(pkt):
             tunnel_packet = self._handle_packet(pkt)
             if tunnel_packet is not None:
-                # send message from queue anyway
                 self._reply(pkt)
 
                 if tunnel_packet.type == TunnelType.PAYLOAD:
@@ -327,7 +326,6 @@ if __name__ == "__main__":
     def receive_messages(tunnel, stop_event):
         """Thread function to receive and forward raw bytes to stdout."""
 
-        # Открываем stdout один раз, а не на каждый пакет
         stdout_fd = sys.stdout.fileno()
 
         while not stop_event.is_set():
@@ -337,16 +335,12 @@ if __name__ == "__main__":
                         continue
 
                     try:
-                        # Пишем напрямую в файловый дескриптор
                         os.write(stdout_fd, received_data)
                     except OSError as e:
                         if e.errno == errno.EPIPE:
-                            # Broken pipe - выход
-                            # logger.error("Broken pipe: программа A закрыла чтение")
                             stop_event.set()
                             return
                         else:
-                            # logger.error("Ошибка записи: %s", e)
                             stop_event.set()
                             return
 
@@ -358,7 +352,7 @@ if __name__ == "__main__":
     def read_stdin_bytes():
         """Read bytes from stdin non-blockingly"""
         try:
-            data = os.read(0, 1024)  # FD 0 — это stdin
+            data = os.read(0, 1024) 
             if not data:
                 return None
             return data
