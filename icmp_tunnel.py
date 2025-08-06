@@ -19,7 +19,7 @@ from scapy.layers.l2 import getmacbyip, Ether
 from scapy.sendrecv import sniff, sendp
 
 ICMP_HEADER_SIZE = 8
-
+MTU = 1300
 
 # Setup file logging with rotation
 def setup_logging():
@@ -142,7 +142,7 @@ class ActiveMessage:
 class Server(AbstractTunnel):
     MESSAGE_LIFETIME = datetime.timedelta(seconds=10)
 
-    def __init__(self, iface: str, mtu: int = 1300):
+    def __init__(self, iface: str, mtu: int):
         super().__init__(mtu)
         self._sniff_thread: Thread | None = None
         self._stop_event = Event()
@@ -193,6 +193,7 @@ class Server(AbstractTunnel):
         def on_pkt(pkt):
             tunnel_packet = self._handle_packet(pkt)
             if tunnel_packet is not None:
+                # send message from queue anyway
                 self._reply(pkt)
 
                 if tunnel_packet.type == TunnelType.PAYLOAD:
@@ -248,7 +249,7 @@ class Server(AbstractTunnel):
 
 
 class Client(AbstractTunnel):
-    def __init__(self, dst: str, mtu: int = 1300):
+    def __init__(self, dst: str, mtu: int):
         super().__init__(mtu)
         self.dst = dst
         self._sniff_thread: Thread | None = None
@@ -306,7 +307,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="ICMP Tunnel - Server/Client")
     parser.add_argument("mode", choices=["server", "client"], help="Run mode: server or client")
-    parser.add_argument("--mtu", type=int, default=1300, help="MTU size (default: 1300)")
+    parser.add_argument("--mtu", type=int, default=MTU, help=f"MTU size (default: {MTU})")
     parser.add_argument("--dst", type=str, help="Destination IP (required for client mode)")
     parser.add_argument("--iface", type=str, help="Network interface (default: eth0)")
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose logging")
@@ -326,6 +327,7 @@ if __name__ == "__main__":
     def receive_messages(tunnel, stop_event):
         """Thread function to receive and forward raw bytes to stdout."""
 
+        # Открываем stdout один раз, а не на каждый пакет
         stdout_fd = sys.stdout.fileno()
 
         while not stop_event.is_set():
@@ -335,12 +337,16 @@ if __name__ == "__main__":
                         continue
 
                     try:
+                        # Пишем напрямую в файловый дескриптор
                         os.write(stdout_fd, received_data)
                     except OSError as e:
                         if e.errno == errno.EPIPE:
+                            # Broken pipe - выход
+                            # logger.error("Broken pipe: программа A закрыла чтение")
                             stop_event.set()
                             return
                         else:
+                            # logger.error("Ошибка записи: %s", e)
                             stop_event.set()
                             return
 
@@ -352,7 +358,7 @@ if __name__ == "__main__":
     def read_stdin_bytes():
         """Read bytes from stdin non-blockingly"""
         try:
-            data = os.read(0, 1024) 
+            data = os.read(0, MTU)  # FD 0 — это stdin
             if not data:
                 return None
             return data
