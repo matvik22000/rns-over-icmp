@@ -358,7 +358,7 @@ if __name__ == "__main__":
     def read_stdin_bytes():
         """Read bytes from stdin non-blockingly"""
         try:
-            data = os.read(0, MTU)  # FD 0 — это stdin
+            data = os.read(0, 1024)  # FD 0 — это stdin
             if not data:
                 return None
             return data
