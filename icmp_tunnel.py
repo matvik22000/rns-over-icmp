@@ -33,7 +33,7 @@ def setup_logging():
 
     # Create rotating file handler (1MB max size, keep 5 backup files)
     file_handler = logging.handlers.RotatingFileHandler(
-        'tunnel.log',
+        os.getenv('ICMP_TUNNEL_LOG_FILE'),
         maxBytes=1024 * 1024,  # 1MB
         backupCount=5
     )
@@ -374,6 +374,7 @@ if __name__ == "__main__":
             if not args.iface:
                 parser.error("--iface must be set in server mode")
 
+            logger.info(f"Starting server on interface {args.iface} with MTU={args.mtu}...")
             server = Server(iface=args.iface, mtu=args.mtu)
             server.start()
             logger.info(f"Server started on interface {args.iface} with MTU={args.mtu}")
