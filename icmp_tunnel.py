@@ -4,22 +4,40 @@ import logging
 import logging.handlers
 import os
 import signal
+import socket
 import sys
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from enum import IntFlag, IntEnum
-from queue import Queue
+from enum import IntEnum
+from queue import Empty, Queue
 from threading import Thread, Event
 from time import sleep
-from typing import Iterable, Tuple, List
+from typing import Iterable, List
 
-from scapy.all import IP, ICMP, send, Raw
+from scapy.layers.inet import IP, ICMP
+from scapy.layers.l2 import Ether, getmacbyip
+from scapy.packet import Raw
 from scapy.config import conf
-from scapy.layers.l2 import getmacbyip, Ether
-from scapy.sendrecv import sniff, sendp
+from scapy.sendrecv import send, sniff, sendp
 
 ICMP_HEADER_SIZE = 8
 MTU = 1300
+
+# Transport tuning:
+#   PING_INTERVAL      - how often the client pings when idle (keepalive + poll)
+#   CLIENT_BURST       - max data packets the client sends per tick
+#   SERVER_MAX_REPLIES - max queued messages the server piggybacks on one ping
+PING_INTERVAL = 0.5
+CLIENT_BURST = 8
+SERVER_MAX_REPLIES = 8
+
+
+def _log_file_path() -> str:
+    env = os.getenv('ICMP_TUNNEL_LOG_FILE')
+    if env:
+        return env
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), 'tunnel.log')
+
 
 # Setup file logging with rotation
 def setup_logging():
@@ -31,23 +49,25 @@ def setup_logging():
         '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
 
-    # Create rotating file handler (1MB max size, keep 5 backup files)
-    file_handler = logging.handlers.RotatingFileHandler(
-        os.getenv('ICMP_TUNNEL_LOG_FILE'),
-        maxBytes=1024 * 1024,  # 1MB
-        backupCount=5
-    )
-    file_handler.setLevel(logging.INFO)
-    file_handler.setFormatter(formatter)
-
-    # Create console handler (stderr)
+    # Create console handler (stderr) first, so a broken log file path
+    # still leaves us with usable output
     console_handler = logging.StreamHandler(sys.stderr)
     console_handler.setLevel(logging.INFO)
     console_handler.setFormatter(formatter)
-
-    # Add handlers to logger
-    logger.addHandler(file_handler)
     logger.addHandler(console_handler)
+
+    # Create rotating file handler (1MB max size, keep 5 backup files)
+    try:
+        file_handler = logging.handlers.RotatingFileHandler(
+            _log_file_path(),
+            maxBytes=1024 * 1024,  # 1MB
+            backupCount=5
+        )
+        file_handler.setLevel(logging.INFO)
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+    except OSError as e:
+        logging.getLogger(__name__).warning(f"No file logging ({e}); stderr only")
 
 
 # Setup logging at module level
@@ -79,7 +99,12 @@ def _decode_bytes_to_packet(payload: bytes) -> TunnelPacket | None:
     if len(payload) < 3 or not payload.startswith(TunnelPacket.MAGIC):
         return None
 
-    flags = TunnelType(payload[2])
+    try:
+        flags = TunnelType(payload[2])
+    except ValueError:
+        # Unknown type byte: not one of ours, ignore instead of raising
+        return None
+
     packet_payload = payload[3:]
 
     return TunnelPacket(type=flags, payload=packet_payload)
@@ -94,7 +119,25 @@ class AbstractTunnel(ABC):
         self.logger = logging.getLogger(self.__class__.__name__)
 
     def send(self, pkt: bytes) -> None:
+        # Frames come from RNS as complete HDLC frames; dropping one keeps the
+        # stream framed (RNS resyncs on flags), while dying would leave RNS
+        # waiting on a pipe nobody reads until it respawns us.
+        if len(pkt) + 3 > self.mtu - ICMP_HEADER_SIZE:
+            self.logger.error(
+                f"outbound frame too large ({len(pkt)}+3 bytes, limit "
+                f"{self.mtu - ICMP_HEADER_SIZE}); dropping - lower the RNS "
+                f"interface mtu or raise tunnel --mtu"
+            )
+            return
         self._send_queue.put(pkt)
+
+    def die(self, msg: str) -> None:
+        # Protocol-uncorrectable errors: exit loudly so the supervisor
+        # (RNS PipeInterface) respawns us with clean state and the error
+        # is visible in the RNS log.
+        self.logger.critical(msg)
+        logging.shutdown()
+        os._exit(1)
 
     def recv(self) -> Iterable[bytes]:
         while True:
@@ -117,19 +160,38 @@ class AbstractTunnel(ABC):
     def decode(self, payload: bytes) -> TunnelPacket | None:
         return _decode_bytes_to_packet(payload)
 
+    def _sniff_loop(self, on_pkt, iface: str | None = None, bpf: str | None = None) -> None:
+        kwargs = dict(
+            prn=on_pkt,
+            store=False,
+            stop_filter=lambda x: self._stop_event.is_set(),
+        )
+        if iface:
+            kwargs["iface"] = iface
+
+        try:
+            if bpf:
+                sniff(filter=bpf, **kwargs)
+            else:
+                sniff(**kwargs)
+        except Exception as e:
+            # Missing libpcap makes BPF filters impossible; raw caps problems
+            # make any sniff impossible. Retry unfiltered once, then die loudly.
+            self.logger.warning(f"sniff with filter failed ({e}); retrying unfiltered")
+            try:
+                sniff(**kwargs)
+            except Exception:
+                self.logger.exception("capture failed fatally")
+                self.die("cannot open capture socket (missing cap_net_raw or libpcap?)")
+
     def _handle_packet(self, pkt) -> TunnelPacket | None:
         if ICMP not in pkt:
             return None
         icmp = pkt[ICMP]
-        if icmp.type not in [0, 8] or not icmp.payload:
+        if not icmp.payload:
             return None
 
-        raw = bytes(icmp.payload)
-        tunnel_packet = self.decode(raw)
-
-        if tunnel_packet is None:
-            return None
-        return tunnel_packet
+        return self.decode(bytes(icmp.payload))
 
 
 @dataclass
@@ -141,11 +203,11 @@ class ActiveMessage:
 
 class Server(AbstractTunnel):
     MESSAGE_LIFETIME = datetime.timedelta(seconds=10)
+    MAX_REPLIES_PER_PING = SERVER_MAX_REPLIES
 
     def __init__(self, iface: str, mtu: int):
         super().__init__(mtu)
         self._sniff_thread: Thread | None = None
-        self._stop_event = Event()
         self.iface = iface
         self.active_messages: List[ActiveMessage] = []  # list of messages, that should be sent
 
@@ -163,7 +225,7 @@ class Server(AbstractTunnel):
             subprocess.run(['sysctl', '-w', 'net.ipv4.icmp_echo_ignore_all=1'],
                            check=True, capture_output=True)
             self.logger.info("Disabled system ICMP echo responses")
-        except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        except (subprocess.CalledProcessError, FileNotFoundError, PermissionError) as e:
             self.logger.warning(f"Failed to disable system pings: {e}")
 
     def _enable_system_pings(self) -> None:
@@ -180,7 +242,7 @@ class Server(AbstractTunnel):
             subprocess.run(['sysctl', '-w', 'net.ipv4.icmp_echo_ignore_all=0'],
                            check=True, capture_output=True)
             self.logger.info("Enabled system ICMP echo responses")
-        except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        except (subprocess.CalledProcessError, FileNotFoundError, PermissionError) as e:
             self.logger.warning(f"Failed to enable system pings: {e}")
 
     def start(self) -> None:
@@ -189,24 +251,36 @@ class Server(AbstractTunnel):
         self._sniff_thread = Thread(target=self._sniff, daemon=True)
         self._sniff_thread.start()
 
+    def stop(self) -> None:
+        self._stop_event.set()
+        self._enable_system_pings()
+        if self._sniff_thread is not None:
+            self._sniff_thread.join(timeout=5)
+
     def _sniff(self) -> None:
         def on_pkt(pkt):
-            tunnel_packet = self._handle_packet(pkt)
-            if tunnel_packet is not None:
-                # send message from queue anyway
-                self._reply(pkt)
+            try:
+                if ICMP not in pkt:
+                    return
+                icmp = pkt[ICMP]
+                # Only client echo requests; our own replies (type 0) must be
+                # ignored or we would answer ourselves in a loop
+                if icmp.type != 8:
+                    return
+                tunnel_packet = self.decode(bytes(icmp.payload)) if icmp.payload else None
+                if tunnel_packet is None:
+                    return
 
                 if tunnel_packet.type == TunnelType.PAYLOAD:
                     self.logger.debug("got packet: %s", str(tunnel_packet))
                     self._recv_queue.put(tunnel_packet.payload)
 
-        sniff(filter="icmp", prn=on_pkt, store=False, stop_filter=lambda x: self._stop_event.is_set())
+                # answer every request, piggybacking queued messages
+                self._reply(pkt)
+            except Exception:
+                self.logger.exception("error handling incoming packet")
 
-    def stop(self) -> None:
-        self._stop_event.set()
-        self._enable_system_pings()
-        if self._sniff_thread is not None:
-            self._sniff_thread.join()
+        self._sniff_loop(on_pkt, iface=self.iface, bpf="icmp")
 
     def _get_message_for_reply(self, dst: str) -> ActiveMessage | None:
         while not self._send_queue.empty():
@@ -230,10 +304,15 @@ class Server(AbstractTunnel):
         icmp_id = pkt[ICMP].id
         icmp_seq = pkt[ICMP].seq
 
-        msg = self._get_message_for_reply(dst_ip)
-        if msg is None:
-            return
-        data = msg.payload
+        # Drain up to MAX_REPLIES_PER_PING queued messages per received ping,
+        # so throughput is not limited to one packet per client ping
+        for i in range(self.MAX_REPLIES_PER_PING):
+            msg = self._get_message_for_reply(dst_ip)
+            if msg is None:
+                return
+            self._send_reply(dst_ip, src_ip, icmp_id, icmp_seq + i, msg.payload)
+
+    def _send_reply(self, dst_ip: str, src_ip: str, icmp_id: int, icmp_seq: int, data: bytes) -> None:
         tunnel_packet = TunnelPacket(type=TunnelType.REPLY if data else TunnelType.EMPTY, payload=data)
 
         ip_pkt = (
@@ -242,16 +321,27 @@ class Server(AbstractTunnel):
                 Raw(load=self.encode(tunnel_packet))
         )
 
-        iface, _, gw = conf.route.route(dst_ip)
-        mac = getmacbyip(gw)
-        if mac:
+        try:
+            # conf.route.route() returns (iface, src_addr, gw) - the gateway
+            # is the THIRD element, not the second
+            iface, _, gw = conf.route.route(dst_ip)
+            mac = getmacbyip(gw or dst_ip)
+            if not mac:
+                self.logger.warning(f"no MAC for {gw or dst_ip}, dropping reply")
+                return
             sendp(Ether(dst=mac) / ip_pkt, iface=iface, verbose=False)
+        except Exception:
+            self.logger.exception(f"failed to send reply to {dst_ip}")
 
 
 class Client(AbstractTunnel):
     def __init__(self, dst: str, mtu: int):
         super().__init__(mtu)
         self.dst = dst
+        try:
+            self.peer_ip = socket.gethostbyname(dst)
+        except OSError:
+            self.die(f"cannot resolve destination {dst!r}")
         self._sniff_thread: Thread | None = None
         self._ping_thread: Thread | None = None
 
@@ -267,24 +357,59 @@ class Client(AbstractTunnel):
 
     def _sniff(self) -> None:
         def on_pkt(pkt):
-            tunnel_packet = self._handle_packet(pkt)
-            if tunnel_packet is not None:
+            try:
+                if ICMP not in pkt:
+                    return
+                icmp = pkt[ICMP]
+                # Only echo replies from our server. The id check keeps other
+                # tunnels' or tools' MAGIC-looking traffic out.
+                if icmp.type != 0 or icmp.id != TunnelPacket.ICMP_ID:
+                    return
+                tunnel_packet = self.decode(bytes(icmp.payload)) if icmp.payload else None
+                if tunnel_packet is None:
+                    return
+                if pkt[IP].src != self.peer_ip:
+                    return
+
                 if tunnel_packet.type == TunnelType.REPLY:
                     self.logger.debug("got packet: %s", str(tunnel_packet))
                     self._recv_queue.put(tunnel_packet.payload)
+            except Exception:
+                self.logger.exception("error handling incoming packet")
 
-        sniff(filter="icmp", prn=on_pkt, store=False, stop_filter=lambda x: self._stop_event.is_set())
+        try:
+            iface, _, _ = conf.route.route(self.peer_ip)
+        except Exception:
+            iface = None
+
+        self._sniff_loop(on_pkt, iface=iface, bpf=f"icmp and src host {self.peer_ip}")
 
     def _ping(self) -> None:
         while not self._stop_event.is_set():
-            sleep(1)
-            if self._send_queue.empty():
-                self._send_empty()
-            else:
-                self._send_data(self._send_queue.get(block=False))
+            try:
+                sent = 0
+                # Send immediately and drain the queue in bursts instead of
+                # at most one packet per second
+                while sent < CLIENT_BURST and not self._send_queue.empty():
+                    self._send_data(self._send_queue.get(block=False))
+                    sent += 1
+                if sent == 0:
+                    self._send_empty()
+            except OSError as e:
+                if e.errno in (errno.EPERM, errno.EACCES):
+                    self.die(
+                        f"no permission for raw sockets ({e}); grant "
+                        f"cap_net_raw,cap_net_admin to the python binary via setcap"
+                    )
+                self.logger.exception("send failed")
+            except Empty:
+                pass
+            except Exception:
+                self.logger.exception("send failed")
+
+            sleep(PING_INTERVAL)
 
     def _send_empty(self):
-
         tunnel_packet = TunnelPacket(type=TunnelType.EMPTY, payload=bytes())
         pkt = IP(dst=self.dst) / ICMP(type=8, id=TunnelPacket.ICMP_ID) / Raw(load=self.encode(tunnel_packet))
         send(pkt, verbose=False)
@@ -299,9 +424,7 @@ class Client(AbstractTunnel):
 
 if __name__ == "__main__":
     import argparse
-    import select
     import threading
-    import queue
 
     logger = logging.getLogger(__name__)
 
@@ -321,9 +444,6 @@ if __name__ == "__main__":
                                                                              logging.handlers.RotatingFileHandler):
                 handler.setLevel(logging.DEBUG)
 
-    import sys
-
-
     def receive_messages(tunnel, stop_event):
         """Thread function to receive and forward raw bytes to stdout."""
 
@@ -337,16 +457,18 @@ if __name__ == "__main__":
                         continue
 
                     try:
-                        # Пишем напрямую в файловый дескриптор
-                        os.write(stdout_fd, received_data)
+                        # Пишем напрямую в файловый дескриптор, доезаписывая
+                        # при частичной записи
+                        view = memoryview(received_data)
+                        while view:
+                            written = os.write(stdout_fd, view)
+                            view = view[written:]
                     except OSError as e:
                         if e.errno == errno.EPIPE:
                             # Broken pipe - выход
-                            # logger.error("Broken pipe: программа A закрыла чтение")
                             stop_event.set()
                             return
                         else:
-                            # logger.error("Ошибка записи: %s", e)
                             stop_event.set()
                             return
 
@@ -356,14 +478,20 @@ if __name__ == "__main__":
 
 
     def read_stdin_bytes():
-        """Read bytes from stdin non-blockingly"""
+        """Read bytes from stdin; returns None on EOF"""
         try:
-            data = os.read(0, 1024)  # FD 0 — это stdin
-            if not data:
-                return None
-            return data
-        except KeyboardInterrupt:
-            pass
+            return os.read(0, 1024) or None
+        except OSError:
+            return None
+
+
+    def request_stop(tunnel, stop_event):
+        stop_event.set()
+        tunnel.stop()
+
+
+    def on_sigterm(*_):
+        raise KeyboardInterrupt
 
 
     try:
@@ -377,22 +505,25 @@ if __name__ == "__main__":
             logger.info(f"Starting server on interface {args.iface} with MTU={args.mtu}...")
             server = Server(iface=args.iface, mtu=args.mtu)
             server.start()
-            logger.info(f"Server started on interface {args.iface} with MTU={args.mtu}")
 
             stop_event = threading.Event()
             receive_thread = threading.Thread(target=receive_messages, args=(server, stop_event), daemon=True)
             receive_thread.start()
 
+            signal.signal(signal.SIGTERM, on_sigterm)
+
             try:
                 while True:
                     message = read_stdin_bytes()
-                    if message:
-                        server.send(message)
+                    if message is None:
+                        logger.info("stdin closed, stopping server")
+                        break
+                    server.send(message)
 
             except KeyboardInterrupt:
                 logger.info("Stopping server...")
-                stop_event.set()
-                server.stop()
+            finally:
+                request_stop(server, stop_event)
 
         elif args.mode == "client":
             if not args.dst:
@@ -400,23 +531,29 @@ if __name__ == "__main__":
 
             client = Client(dst=args.dst, mtu=args.mtu)
             client.start()
-            logger.info(f"Client started, connecting to {args.dst} with MTU={args.mtu}")
+            logger.info(f"Client started, connecting to {args.dst} ({client.peer_ip}) with MTU={args.mtu}")
 
             stop_event = threading.Event()
             receive_thread = threading.Thread(target=receive_messages, args=(client, stop_event), daemon=True)
             receive_thread.start()
 
+            signal.signal(signal.SIGTERM, on_sigterm)
+
             try:
                 while True:
                     message = read_stdin_bytes()
-                    if message:
-                        client.send(message)
+                    if message is None:
+                        logger.info("stdin closed, stopping client")
+                        break
+                    client.send(message)
 
             except KeyboardInterrupt:
                 logger.info("Stopping client...")
-                stop_event.set()
-                client.stop()
+            finally:
+                request_stop(client, stop_event)
 
+    except KeyboardInterrupt:
+        pass
     except Exception as e:
-        logger.error(f"Error: {e}")
+        logger.exception(f"Error: {e}")
         sys.exit(1)
