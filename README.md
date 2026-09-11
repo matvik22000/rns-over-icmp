@@ -79,3 +79,10 @@ One server can serve **any number** of clients.
   `SERVER_MAX_REPLIES` at the top of the script (defaults: client pings every
   0.5 s and bursts up to 8 packets; the server piggybacks up to 8 queued
   messages per received ping).
+- The client self-heals after network outages (suspend/resume, interface
+  flaps, route changes): sends back off (up to `SEND_BACKOFF_CAP` between
+  probes) while the interface is down, the capture socket is reopened every
+  `SNIFF_CYCLE` seconds with a freshly resolved route, and if the server
+  stays silent past `RECV_STALE_WARN` + `RECV_STALE_DIE` while sends still
+  succeed, the client exits so the RNS PipeInterface respawns it with clean
+  state.

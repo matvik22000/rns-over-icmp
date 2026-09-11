@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from enum import IntEnum
 from queue import Empty, Queue
 from threading import Thread, Event
-from time import sleep
+from time import monotonic, sleep
 from typing import Iterable, List
 
 from scapy.layers.inet import IP, ICMP
@@ -30,6 +30,18 @@ MTU = 1300
 PING_INTERVAL = 0.5
 CLIENT_BURST = 8
 SERVER_MAX_REPLIES = 8
+
+# Recovery tuning:
+#   SEND_BACKOFF_CAP - max interval between send attempts while network is down
+#   SEND_LOG_EVERY   - log a "still down" line every N failed send attempts
+#   RECV_STALE_WARN  - reply silence before suspecting a stale route/socket
+#   RECV_STALE_DIE   - extra silence past WARN before exiting for respawn
+#   SNIFF_CYCLE      - max lifetime of one capture socket before reopening
+SEND_BACKOFF_CAP = 10.0
+SEND_LOG_EVERY = 20
+RECV_STALE_WARN = 30.0
+RECV_STALE_DIE = 90.0
+SNIFF_CYCLE = 30.0
 
 
 def _log_file_path() -> str:
@@ -160,29 +172,41 @@ class AbstractTunnel(ABC):
     def decode(self, payload: bytes) -> TunnelPacket | None:
         return _decode_bytes_to_packet(payload)
 
-    def _sniff_loop(self, on_pkt, iface: str | None = None, bpf: str | None = None) -> None:
+    def _sniff_loop(self, on_pkt, iface: str | None = None, bpf: str | None = None,
+                    timeout: float | None = None) -> None:
         kwargs = dict(
             prn=on_pkt,
             store=False,
             stop_filter=lambda x: self._stop_event.is_set(),
         )
+        if timeout:
+            kwargs["timeout"] = timeout
         if iface:
             kwargs["iface"] = iface
 
-        try:
-            if bpf:
-                sniff(filter=bpf, **kwargs)
-            else:
-                sniff(**kwargs)
-        except Exception as e:
-            # Missing libpcap makes BPF filters impossible; raw caps problems
-            # make any sniff impossible. Retry unfiltered once, then die loudly.
-            self.logger.warning(f"sniff with filter failed ({e}); retrying unfiltered")
+        use_filter = bpf is not None
+        while not self._stop_event.is_set():
             try:
-                sniff(**kwargs)
-            except Exception:
-                self.logger.exception("capture failed fatally")
-                self.die("cannot open capture socket (missing cap_net_raw or libpcap?)")
+                if use_filter:
+                    sniff(filter=bpf, **kwargs)
+                else:
+                    sniff(**kwargs)
+                # Returned normally: stop request or timeout expiry. The
+                # caller decides whether to reopen (it may want to
+                # re-resolve the route first).
+                return
+            except Exception as e:
+                if isinstance(e, OSError) and e.errno in (errno.EPERM, errno.EACCES):
+                    self.die("cannot open capture socket (missing cap_net_raw or libpcap?)")
+                if use_filter:
+                    # Missing libpcap makes BPF filters impossible; fall back
+                    # to unfiltered and let on_pkt do the filtering
+                    self.logger.warning(f"sniff with filter failed ({e}); retrying unfiltered")
+                    use_filter = False
+                    continue
+                self.logger.warning(f"capture failed ({e}); retrying in 5s")
+                if self._stop_event.wait(5):
+                    return
 
     def _handle_packet(self, pkt) -> TunnelPacket | None:
         if ICMP not in pkt:
@@ -344,6 +368,9 @@ class Client(AbstractTunnel):
             self.die(f"cannot resolve destination {dst!r}")
         self._sniff_thread: Thread | None = None
         self._ping_thread: Thread | None = None
+        # Receive-path health tracking (monotonic seconds)
+        self._last_rx = monotonic()
+        self._stale_since: float | None = None
 
     def start(self) -> None:
         self._ping_thread = Thread(target=self._ping, daemon=True)
@@ -371,20 +398,30 @@ class Client(AbstractTunnel):
                 if pkt[IP].src != self.peer_ip:
                     return
 
+                # Any reply (EMPTY included) proves the receive path is alive
+                self._last_rx = monotonic()
+
                 if tunnel_packet.type == TunnelType.REPLY:
                     self.logger.debug("got packet: %s", str(tunnel_packet))
                     self._recv_queue.put(tunnel_packet.payload)
             except Exception:
                 self.logger.exception("error handling incoming packet")
 
-        try:
-            iface, _, _ = conf.route.route(self.peer_ip)
-        except Exception:
-            iface = None
+        bpf = f"icmp and src host {self.peer_ip}"
+        while not self._stop_event.is_set():
+            # Re-resolve the interface on every reopen so a route or
+            # interface change during an outage is picked up without a
+            # restart; otherwise a socket opened before the outage can stay
+            # silently bound to a dead interface forever
+            try:
+                iface, _, _ = conf.route.route(self.peer_ip)
+            except Exception:
+                iface = None
 
-        self._sniff_loop(on_pkt, iface=iface, bpf=f"icmp and src host {self.peer_ip}")
+            self._sniff_loop(on_pkt, iface=iface, bpf=bpf, timeout=SNIFF_CYCLE)
 
     def _ping(self) -> None:
+        failures = 0
         while not self._stop_event.is_set():
             try:
                 sent = 0
@@ -395,19 +432,63 @@ class Client(AbstractTunnel):
                     sent += 1
                 if sent == 0:
                     self._send_empty()
+                if failures:
+                    self.logger.info(f"network recovered after {failures} failed send attempts")
+                    failures = 0
+                    # Replies were blocked for as long as sends were; restart
+                    # the receive watchdog from here
+                    self._last_rx = monotonic()
+                    self._stale_since = None
             except OSError as e:
                 if e.errno in (errno.EPERM, errno.EACCES):
                     self.die(
                         f"no permission for raw sockets ({e}); grant "
                         f"cap_net_raw,cap_net_admin to the python binary via setcap"
                     )
-                self.logger.exception("send failed")
+                failures += 1
+                if failures == 1:
+                    self.logger.warning(f"network down ({e}); will retry")
+                elif failures % SEND_LOG_EVERY == 0:
+                    self.logger.warning(f"network still down after {failures} attempts ({e})")
             except Empty:
                 pass
             except Exception:
+                failures += 1
                 self.logger.exception("send failed")
 
-            sleep(PING_INTERVAL)
+            self._watch_replies(failures == 0)
+
+            # Back off while the network is down so we do not flood the log,
+            # but keep probing so we resume within SEND_BACKOFF_CAP of the
+            # network coming back
+            if failures:
+                sleep(min(SEND_BACKOFF_CAP, PING_INTERVAL * 2 ** min(failures, 6)))
+            else:
+                sleep(PING_INTERVAL)
+
+    def _watch_replies(self, sending_ok: bool) -> None:
+        """Detect a silently dead receive path (stale capture socket or route
+        after suspend or an interface change) and recover."""
+        now = monotonic()
+        silent_for = now - self._last_rx
+        if silent_for <= RECV_STALE_WARN:
+            self._stale_since = None
+            return
+
+        if self._stale_since is None:
+            self._stale_since = now
+            try:
+                # The scapy routing table is built at startup and goes stale
+                # when interfaces flap or the default route changes
+                conf.route.resync()
+            except Exception:
+                pass
+            self.logger.warning(f"no tunnel replies for {int(silent_for)}s; re-resolved routes")
+        elif sending_ok and now - self._stale_since > RECV_STALE_DIE:
+            # Sends succeed but nothing comes back: the capture socket is
+            # bound to a dead interface. Exit so the RNS PipeInterface
+            # respawns us with clean state.
+            self.die(f"no tunnel replies for {int(silent_for)}s; exiting for respawn")
 
     def _send_empty(self):
         tunnel_packet = TunnelPacket(type=TunnelType.EMPTY, payload=bytes())
